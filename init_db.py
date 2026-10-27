@@ -1,134 +1,122 @@
 """
 init_db.py
-Crea (o verifica) la base de datos SQLite del dashboard a partir de schema.sql.
-Incluye comprobaciones básicas de integridad tras la creación.
+Crea (o verifica) la base de datos SQLite y la estructura de carpetas:
+
+    data/
+    ├── portfolio.db
+    ├── RAW/<plataforma>/         PDFs pendientes de procesar
+    └── processed/<plataforma>/   PDFs ya cargados
+
+Es seguro re-ejecutarlo: no borra datos existentes.
 
 Uso:
-    python init_db.py
+    python3 init_db.py
 """
 
 import sqlite3
 import sys
 from pathlib import Path
 
-# --- Configuración de rutas ---------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "data" / "portfolio.db"
+DATA_DIR = BASE_DIR / "data"
+DB_PATH = DATA_DIR / "portfolio.db"
 SCHEMA_PATH = BASE_DIR / "schema.sql"
+RAW_DIR = DATA_DIR / "RAW"
+PROCESSED_DIR = DATA_DIR / "processed"
 
 EXPECTED_TABLES = {
-    "fondos",
-    "fondos_ticker_mapping",
+    "plataformas",
+    "instrumentos",
+    "instrumentos_ticker_mapping",
     "posiciones_compra",
-    "valor_historico_fondo",
+    "valor_historico_instrumento",
     "valor_actual_snapshot",
     "xray_cartera_snapshot",
     "xray_sector_snapshot",
     "xray_pais_snapshot",
-    "xray_posiciones_fondo_snapshot",
+    "xray_posiciones_snapshot",
     "xray_top_holdings_snapshot",
 }
 
-EXPECTED_VIEWS = {
-    "v_posicion_neta_fondo",
-    "v_huecos_precio",
-}
+EXPECTED_VIEWS = {"v_posicion_neta", "v_huecos_precio"}
 
 
 def crear_base_datos() -> sqlite3.Connection:
-    """Crea la carpeta data/ si no existe y ejecuta schema.sql contra la BD."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     if not SCHEMA_PATH.exists():
         print(f"ERROR: no se encuentra {SCHEMA_PATH}")
         sys.exit(1)
 
-    schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
-
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON;")
-    conn.executescript(schema_sql)
+    conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
     conn.commit()
     return conn
 
 
-def comprobar_tablas(conn: sqlite3.Connection) -> bool:
-    """Verifica que todas las tablas esperadas existen."""
-    cur = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';"
-    )
-    tablas_existentes = {row[0] for row in cur.fetchall()}
-    faltantes = EXPECTED_TABLES - tablas_existentes
-
-    if faltantes:
-        print(f"FALTAN TABLAS: {faltantes}")
-        return False
-
-    print(f"OK — {len(EXPECTED_TABLES)} tablas creadas correctamente:")
-    for t in sorted(tablas_existentes):
-        print(f"   - {t}")
+def crear_carpetas(conn: sqlite3.Connection) -> bool:
+    """Crea RAW/<plataforma> y processed/<plataforma> para cada plataforma de la BD."""
+    plataformas = [r[0] for r in conn.execute("SELECT id FROM plataformas;")]
+    for p in plataformas:
+        (RAW_DIR / p).mkdir(parents=True, exist_ok=True)
+        (PROCESSED_DIR / p).mkdir(parents=True, exist_ok=True)
+    print(f"OK - carpetas creadas para {len(plataformas)} plataformas:")
+    for p in plataformas:
+        print(f"   - data/RAW/{p}  |  data/processed/{p}")
     return True
 
 
-def comprobar_vistas(conn: sqlite3.Connection) -> bool:
-    """Verifica que las vistas esperadas existen."""
+def comprobar_objetos(conn, tipo: str, esperados: set) -> bool:
     cur = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='view';"
+        "SELECT name FROM sqlite_master WHERE type=? AND name NOT LIKE 'sqlite_%';",
+        (tipo,),
     )
-    vistas_existentes = {row[0] for row in cur.fetchall()}
-    faltantes = EXPECTED_VIEWS - vistas_existentes
-
+    existentes = {r[0] for r in cur.fetchall()}
+    faltantes = esperados - existentes
     if faltantes:
-        print(f"FALTAN VISTAS: {faltantes}")
+        print(f"FALTAN ({tipo}): {faltantes}")
         return False
-
-    print(f"OK — {len(EXPECTED_VIEWS)} vistas creadas correctamente:")
-    for v in sorted(vistas_existentes):
-        print(f"   - {v}")
+    print(f"OK - {len(esperados)} {tipo}s correctos")
     return True
 
 
-def comprobar_claves_foraneas(conn: sqlite3.Connection) -> bool:
-    """PRAGMA foreign_key_check: detecta violaciones de integridad referencial."""
-    cur = conn.execute("PRAGMA foreign_key_check;")
-    violaciones = cur.fetchall()
+def comprobar_claves_foraneas(conn) -> bool:
+    violaciones = conn.execute("PRAGMA foreign_key_check;").fetchall()
     if violaciones:
-        print(f"VIOLACIONES DE CLAVE FORÁNEA: {violaciones}")
+        print(f"VIOLACIONES DE CLAVE FORANEA: {violaciones}")
         return False
-    print("OK — sin violaciones de claves foráneas")
+    print("OK - sin violaciones de claves foraneas")
     return True
 
 
-def comprobar_integridad(conn: sqlite3.Connection) -> bool:
-    """PRAGMA integrity_check: verifica que el fichero .db no está corrupto."""
-    cur = conn.execute("PRAGMA integrity_check;")
-    resultado = cur.fetchone()[0]
-    if resultado != "ok":
-        print(f"PROBLEMA DE INTEGRIDAD: {resultado}")
+def comprobar_integridad(conn) -> bool:
+    res = conn.execute("PRAGMA integrity_check;").fetchone()[0]
+    if res != "ok":
+        print(f"PROBLEMA DE INTEGRIDAD: {res}")
         return False
-    print("OK — integridad del fichero .db verificada")
+    print("OK - integridad del fichero .db verificada")
     return True
 
 
 def main():
     print(f"Base de datos: {DB_PATH}\n")
-
     conn = crear_base_datos()
 
     checks = [
-        comprobar_tablas(conn),
-        comprobar_vistas(conn),
+        comprobar_objetos(conn, "table", EXPECTED_TABLES),
+        comprobar_objetos(conn, "view", EXPECTED_VIEWS),
         comprobar_claves_foraneas(conn),
         comprobar_integridad(conn),
+        crear_carpetas(conn),
     ]
-
     conn.close()
 
     print()
     if all(checks):
-        print("Base de datos lista para usar.")
+        print("Todo listo.")
     else:
-        print("Revisa los errores anteriores antes de continuar.")
+        print("Revisa los errores anteriores.")
         sys.exit(1)
 
 

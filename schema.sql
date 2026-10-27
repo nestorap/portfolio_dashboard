@@ -1,92 +1,111 @@
 -- =========================================================
--- portfolio-xray :: schema.sql
--- Base de datos SQLite para tracking de inversiones en fondos
+-- portfolio-xray :: schema.sql  (v2: multi-plataforma)
 -- =========================================================
 
 PRAGMA foreign_keys = ON;
 
 -- ---------------------------------------------------------
--- 1. FONDOS (catálogo maestro)
+-- 0. PLATAFORMAS (lista maestra; el nombre coincide con la
+--    subcarpeta de data/RAW/ y data/processed/)
 -- ---------------------------------------------------------
-CREATE TABLE IF NOT EXISTS fondos (
+CREATE TABLE IF NOT EXISTS plataformas (
+    id          TEXT PRIMARY KEY,        -- 'myinvestor', 'interactive_brokers'...
+    nombre      TEXT NOT NULL,
+    activa      BOOLEAN DEFAULT 1
+);
+
+INSERT OR IGNORE INTO plataformas (id, nombre) VALUES
+    ('myinvestor',          'MyInvestor'),
+    ('interactive_brokers', 'Interactive Brokers');
+
+-- ---------------------------------------------------------
+-- 1. INSTRUMENTOS (fondos, ETFs, acciones...) - catálogo maestro
+--    Un ISIN es independiente de la plataforma donde lo tengas.
+-- ---------------------------------------------------------
+CREATE TABLE IF NOT EXISTS instrumentos (
     isin                    TEXT PRIMARY KEY,
     nombre                  TEXT NOT NULL,
+    tipo                    TEXT NOT NULL DEFAULT 'fondo'
+                             CHECK (tipo IN ('fondo','etf','accion','otro')),
     categoria_morningstar   TEXT,
     gastos_corrientes       REAL,
-    plataforma              TEXT DEFAULT 'MyInvestor',   -- para multi-plataforma futuro
     activo                  BOOLEAN DEFAULT 1,
     fecha_alta              DATE DEFAULT (date('now'))
 );
 
 -- ---------------------------------------------------------
--- 2. MAPEO DE TICKERS (para automatizar precios vía yfinance)
+-- 2. MAPEO DE TICKERS (para precios vía yfinance)
 -- ---------------------------------------------------------
-CREATE TABLE IF NOT EXISTS fondos_ticker_mapping (
-    isin                    TEXT PRIMARY KEY REFERENCES fondos(isin),
+CREATE TABLE IF NOT EXISTS instrumentos_ticker_mapping (
+    isin                    TEXT PRIMARY KEY REFERENCES instrumentos(isin),
     yahoo_ticker            TEXT,
     disponible_yahoo        BOOLEAN DEFAULT 0,
     ultima_verificacion     DATE
 );
 
 -- ---------------------------------------------------------
--- 3. POSICIONES DE COMPRA (manual, retroactivo permitido)
+-- 3. OPERACIONES (manual, retroactivo permitido)
 -- ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS posiciones_compra (
     id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-    isin                        TEXT NOT NULL REFERENCES fondos(isin),
-    fecha_compra                DATE NOT NULL,          -- fecha real de la operación
-    importe_invertido           REAL NOT NULL,           -- € aportados (positivo=compra, negativo=venta)
+    plataforma                  TEXT NOT NULL REFERENCES plataformas(id),
+    isin                        TEXT NOT NULL REFERENCES instrumentos(isin),
+    fecha_compra                DATE NOT NULL,
+    importe_invertido           REAL NOT NULL,
     participaciones             REAL NOT NULL,
-    valor_liquidativo_compra    REAL NOT NULL,           -- importe / participaciones
-    tipo_operacion               TEXT NOT NULL DEFAULT 'compra'
+    valor_liquidativo_compra    REAL NOT NULL,
+    tipo_operacion              TEXT NOT NULL DEFAULT 'compra'
                                  CHECK (tipo_operacion IN ('compra','venta','traspaso_entrada','traspaso_salida')),
-    plataforma                  TEXT DEFAULT 'MyInvestor',
     notas                       TEXT,
-    fecha_registro               TIMESTAMP DEFAULT CURRENT_TIMESTAMP  -- cuándo TÚ lo metiste (auditoría)
+    fecha_registro              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_compras_isin_fecha
-    ON posiciones_compra(isin, fecha_compra);
+CREATE INDEX IF NOT EXISTS idx_compras_plat_isin_fecha
+    ON posiciones_compra(plataforma, isin, fecha_compra);
 
 -- ---------------------------------------------------------
--- 4. VALOR HISTÓRICO DEL FONDO (precio por fecha, con fuente)
+-- 4. VALOR HISTÓRICO (precio por fecha; no depende de plataforma)
 -- ---------------------------------------------------------
-CREATE TABLE IF NOT EXISTS valor_historico_fondo (
+CREATE TABLE IF NOT EXISTS valor_historico_instrumento (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    isin                TEXT NOT NULL REFERENCES fondos(isin),
+    isin                TEXT NOT NULL REFERENCES instrumentos(isin),
     fecha               DATE NOT NULL,
     valor_liquidativo   REAL NOT NULL,
     fuente              TEXT NOT NULL DEFAULT 'manual'
-                         CHECK (fuente IN ('yahoo_finance','manual','morningstar_pdf','myinvestor')),
+                         CHECK (fuente IN ('yahoo_finance','manual','morningstar_pdf','broker')),
     fecha_registro      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(isin, fecha)   -- evita duplicados: un único precio por fondo y día
+    UNIQUE(isin, fecha)
 );
 
 CREATE INDEX IF NOT EXISTS idx_valor_hist_isin_fecha
-    ON valor_historico_fondo(isin, fecha);
+    ON valor_historico_instrumento(isin, fecha);
 
 -- ---------------------------------------------------------
--- 5. SNAPSHOT DE VALOR ACTUAL (foto periódica de tu cartera)
+-- 5. SNAPSHOT DE VALOR ACTUAL (foto periódica por plataforma)
 -- ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS valor_actual_snapshot (
     id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-    fecha_snapshot               DATE NOT NULL,
-    isin                        TEXT NOT NULL REFERENCES fondos(isin),
-    valor_liquidativo_actual     REAL NOT NULL,
-    participaciones_totales      REAL NOT NULL,
-    valor_actual                REAL NOT NULL,           -- valor_liquidativo * participaciones
+    fecha_snapshot              DATE NOT NULL,
+    plataforma                  TEXT NOT NULL REFERENCES plataformas(id),
+    isin                        TEXT NOT NULL REFERENCES instrumentos(isin),
+    valor_liquidativo_actual    REAL NOT NULL,
+    participaciones_totales     REAL NOT NULL,
+    valor_actual                REAL NOT NULL,
     ganancia_pct                REAL,
     ganancia_eur                REAL,
     fuente                      TEXT DEFAULT 'manual',
-    UNIQUE(isin, fecha_snapshot)
+    UNIQUE(plataforma, isin, fecha_snapshot)
 );
 
 -- ---------------------------------------------------------
--- 6. X-RAY CARTERA - CABECERA (una fila por PDF descargado)
+-- 6. X-RAY CABECERA (una fila por PDF)
 -- ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS xray_cartera_snapshot (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-    fecha_informe           DATE NOT NULL UNIQUE,   -- fecha del PDF, ej. 2026-07-17
+    fecha_informe           DATE NOT NULL,
+    plataforma              TEXT NOT NULL REFERENCES plataformas(id),
+    tipo_inversion          TEXT NOT NULL
+                             CHECK (tipo_inversion IN ('fondos','cartera_standard','etf')),
     pct_acciones            REAL,
     pct_obligaciones        REAL,
     pct_efectivo            REAL,
@@ -107,43 +126,44 @@ CREATE TABLE IF NOT EXISTS xray_cartera_snapshot (
     rent_1_ano              REAL,
     rent_3_anos_anualizada  REAL,
     rent_5_anos_anualizada  REAL,
-    pdf_origen              TEXT,     -- nombre de archivo, para trazabilidad
-    fecha_registro          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    pdf_origen              TEXT,
+    fecha_registro          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(fecha_informe, plataforma, tipo_inversion)
 );
 
 -- ---------------------------------------------------------
--- 7. X-RAY SECTORES (dimensión: ~11-12 filas por fecha)
+-- 7. X-RAY SECTORES
 -- ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS xray_sector_snapshot (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     xray_snapshot_id    INTEGER NOT NULL REFERENCES xray_cartera_snapshot(id) ON DELETE CASCADE,
-    sector              TEXT NOT NULL,     -- 'Tecnología', 'Salud', etc.
-    supersector         TEXT,              -- 'Cíclico' | 'Sensible al ciclo' | 'Defensivo'
+    sector              TEXT NOT NULL,
+    supersector         TEXT,
     pct_cartera         REAL,
     pct_benchmark       REAL,
     UNIQUE(xray_snapshot_id, sector)
 );
 
 -- ---------------------------------------------------------
--- 8. X-RAY PAÍSES (dimensión: ~10 filas por fecha, ampliable)
+-- 8. X-RAY PAÍSES
 -- ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS xray_pais_snapshot (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     xray_snapshot_id    INTEGER NOT NULL REFERENCES xray_cartera_snapshot(id) ON DELETE CASCADE,
     pais                TEXT NOT NULL,
-    region               TEXT,             -- 'Europa', 'América', 'Asia', etc. (opcional)
+    region              TEXT,
     pct_cartera         REAL,
     pct_benchmark       REAL,
     UNIQUE(xray_snapshot_id, pais)
 );
 
 -- ---------------------------------------------------------
--- 9. X-RAY POSICIONES DE FONDO (los fondos dentro del X-Ray)
+-- 9. X-RAY POSICIONES (instrumentos dentro del X-Ray)
 -- ---------------------------------------------------------
-CREATE TABLE IF NOT EXISTS xray_posiciones_fondo_snapshot (
+CREATE TABLE IF NOT EXISTS xray_posiciones_snapshot (
     id                          INTEGER PRIMARY KEY AUTOINCREMENT,
     xray_snapshot_id            INTEGER NOT NULL REFERENCES xray_cartera_snapshot(id) ON DELETE CASCADE,
-    isin                        TEXT REFERENCES fondos(isin),
+    isin                        TEXT REFERENCES instrumentos(isin),
     nombre                      TEXT NOT NULL,
     peso_pct                    REAL,
     rating_morningstar          INTEGER CHECK (rating_morningstar BETWEEN 1 AND 5),
@@ -156,7 +176,7 @@ CREATE TABLE IF NOT EXISTS xray_posiciones_fondo_snapshot (
 );
 
 -- ---------------------------------------------------------
--- 10. X-RAY TOP HOLDINGS (top 10 acciones subyacentes)
+-- 10. X-RAY TOP HOLDINGS
 -- ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS xray_top_holdings_snapshot (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,12 +190,13 @@ CREATE TABLE IF NOT EXISTS xray_top_holdings_snapshot (
 );
 
 -- =========================================================
--- VISTAS DE UTILIDAD (opcional, pero facilitan el dashboard)
+-- VISTAS
 -- =========================================================
 
--- Resumen de posición neta por fondo (participaciones y coste medio)
-CREATE VIEW IF NOT EXISTS v_posicion_neta_fondo AS
+-- Posición neta por plataforma e instrumento
+CREATE VIEW IF NOT EXISTS v_posicion_neta AS
 SELECT
+    plataforma,
     isin,
     SUM(CASE WHEN tipo_operacion IN ('compra','traspaso_entrada') THEN participaciones
              WHEN tipo_operacion IN ('venta','traspaso_salida') THEN -participaciones
@@ -184,12 +205,12 @@ SELECT
              WHEN tipo_operacion IN ('venta','traspaso_salida') THEN -importe_invertido
              ELSE 0 END) AS importe_neto_invertido
 FROM posiciones_compra
-GROUP BY isin;
+GROUP BY plataforma, isin;
 
--- Huecos de precio: compras sin valor histórico en esa fecha exacta
+-- Compras sin precio histórico en esa fecha
 CREATE VIEW IF NOT EXISTS v_huecos_precio AS
 SELECT DISTINCT pc.isin, pc.fecha_compra
 FROM posiciones_compra pc
-LEFT JOIN valor_historico_fondo vh
+LEFT JOIN valor_historico_instrumento vh
     ON vh.isin = pc.isin AND vh.fecha = pc.fecha_compra
 WHERE vh.id IS NULL;
